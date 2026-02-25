@@ -20,3 +20,11 @@ __pycache__
 # Misc
 .*cache
 .DS_Store
+
+# WorkflowWatch app
+workflowwatch/.venv/
+workflowwatch/data/*.db
+workflowwatch/data/*.db-wal
+workflowwatch/data/*.db-shm
+workflowwatch/frontend/node_modules/
+workflowwatch/frontend/dist/
