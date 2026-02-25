@@ -28,3 +28,4 @@ workflowwatch/data/*.db-wal
 workflowwatch/data/*.db-shm
 workflowwatch/frontend/node_modules/
 workflowwatch/frontend/dist/
+workflowwatch/frontend/.env*
