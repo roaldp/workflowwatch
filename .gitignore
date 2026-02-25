@@ -26,6 +26,8 @@ workflowwatch/.venv/
 workflowwatch/data/*.db
 workflowwatch/data/*.db-wal
 workflowwatch/data/*.db-shm
+workflowwatch/data/aw-buckets-export.json
+workflowwatch/data/*.json
 workflowwatch/frontend/node_modules/
 workflowwatch/frontend/dist/
 workflowwatch/frontend/.env*
