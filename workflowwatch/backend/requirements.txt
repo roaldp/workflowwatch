@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+httpx
+pydantic
+pydantic-settings
+aiosqlite
+# WP-7: semantic auto-labeling (optional — degrades gracefully if absent)
+sentence-transformers
+faiss-cpu
