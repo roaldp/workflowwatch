@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, watch, nextTick } from 'vue'
+import { storeToRefs } from 'pinia'
 import type { TimelineEvent } from '../types/timeline'
 import { formatTime, formatDuration } from '../types/timeline'
 import { useTimelineStore } from '../stores/timeline'
@@ -9,13 +10,18 @@ import { api } from '../api/client'
 
 const props = defineProps<{
   events: TimelineEvent[]
+  patternView?: boolean
 }>()
 
 const timeline = useTimelineStore()
 const sessionsStore = useSessionsStore()
 const workflowsStore = useWorkflowsStore()
+const { suggestions, focusEventKey, suggestionPreview } = storeToRefs(timeline)
 const unlabelingId = ref<string | null>(null)
-const acceptingId = ref<string | null>(null)
+const removingPatternId = ref<string | null>(null)
+const editingLabelId = ref<string | null>(null)
+const relabelingId = ref<string | null>(null)
+const rowRefs = new Map<string, HTMLTableRowElement>()
 
 const unlabeledEvents = computed(() => props.events.filter((e) => !e.session_id))
 const allUnlabeledSelected = computed(
@@ -37,17 +43,71 @@ function toggleSelectAll() {
   }
 }
 
-// Suggestions for a row: auto-suggested workflow first, then top alternatives (max 3 total)
+function eventKey(e: TimelineEvent) {
+  return `${e.aw_bucket_id}:${e.aw_event_id}`
+}
+
+function eventRefKey(ref: { aw_bucket_id: string; aw_event_id: number }) {
+  return `${ref.aw_bucket_id}:${ref.aw_event_id}`
+}
+
+type PatternConfidence = 'low' | 'medium' | 'high'
+
+function confidenceFromScore(score: number): PatternConfidence {
+  if (score >= 6) return 'high'
+  if (score >= 4) return 'medium'
+  return 'low'
+}
+
+const patternHintByEvent = computed(() => {
+  const map = new Map<string, {
+    workflowId: string
+    score: number
+    confidence: PatternConfidence
+    indicators: string[]
+  }>()
+  for (const s of suggestions.value) {
+    if (s.score < 6) continue
+    const confidence = confidenceFromScore(s.score)
+    for (const ref of s.event_refs) {
+      const key = `${ref.aw_bucket_id}:${ref.aw_event_id}`
+      const current = map.get(key)
+      if (!current || s.score > current.score) {
+        map.set(key, {
+          workflowId: s.workflow_id,
+          score: s.score,
+          confidence,
+          indicators: s.matched_indicators ?? [],
+        })
+      }
+    }
+  }
+  return map
+})
+
+// Suggestions for a row: pattern-suggested workflow first, then manual alternatives (max 3 total)
 function suggestionsFor(event: TimelineEvent) {
   if (event.session_id) return []
-  const chips: Array<{ id: string; name: string; color: string | null; isPrimary: boolean }> = []
-
-  if (event.suggested_workflow_id && event.suggested_workflow_name) {
+  const chips: Array<{
+    id: string
+    name: string
+    color: string | null
+    isPrimary: boolean
+    score?: number
+    confidence?: PatternConfidence
+    indicators?: string[]
+  }> = []
+  const hint = patternHintByEvent.value.get(eventKey(event))
+  if (hint) {
+    const wf = workflowsStore.workflows.find((w) => w.id === hint.workflowId)
     chips.push({
-      id: event.suggested_workflow_id,
-      name: event.suggested_workflow_name,
-      color: event.suggested_workflow_color ?? null,
+      id: hint.workflowId,
+      name: wf?.name ?? hint.workflowId,
+      color: wf?.color ?? null,
       isPrimary: true,
+      score: hint.score,
+      confidence: hint.confidence,
+      indicators: hint.indicators,
     })
   }
 
@@ -62,28 +122,35 @@ function suggestionsFor(event: TimelineEvent) {
 
 async function unlabel(e: TimelineEvent) {
   if (!e.session_id) return
-  unlabelingId.value = `${e.aw_bucket_id}:${e.aw_event_id}`
+  if (e.session_id === '__optimistic__') return
+  const key = `${e.aw_bucket_id}:${e.aw_event_id}`
+  unlabelingId.value = key
   try {
+    timeline.optimisticallyUnlabelEvent(e)
     await sessionsStore.removeEventsFromSession(e.session_id, [
       { aw_bucket_id: e.aw_bucket_id, aw_event_id: e.aw_event_id },
     ])
-    await timeline.fetchTimeline()
+    timeline.silentRefetch()
+    if (editingLabelId.value === key) editingLabelId.value = null
+  } catch {
+    timeline.silentRefetch()
   } finally {
     unlabelingId.value = null
   }
 }
 
-async function acceptSuggestion(e: TimelineEvent) {
-  acceptingId.value = `${e.aw_bucket_id}:${e.aw_event_id}`
-  try {
-    await timeline.acceptAutoLabel(e)
-  } finally {
-    acceptingId.value = null
-  }
+function contributesToPatternProgress(event: TimelineEvent, workflowId: string): boolean {
+  const key = eventKey(event)
+  return suggestions.value.some(
+    (s) =>
+      s.workflow_id === workflowId &&
+      s.event_refs.some((ref) => eventRefKey(ref) === key)
+  )
 }
 
 async function quickLabel(event: TimelineEvent, workflowId: string) {
   const wf = workflowsStore.workflows.find((w) => w.id === workflowId)
+  const contributes = contributesToPatternProgress(event, workflowId)
   // Instant optimistic update — row appears labeled immediately
   timeline.optimisticallyLabelEvent(event, workflowId, wf?.name ?? '', wf?.color ?? null)
   try {
@@ -92,11 +159,122 @@ async function quickLabel(event: TimelineEvent, workflowId: string) {
       date: timeline.date,
       events: [{ aw_bucket_id: event.aw_bucket_id, aw_event_id: event.aw_event_id }],
     })
+    if (contributes) {
+      timeline.markPatternContribution(workflowId, {
+        aw_bucket_id: event.aw_bucket_id,
+        aw_event_id: event.aw_event_id,
+      })
+    }
     timeline.silentRefetch() // background sync, no loading flash
   } catch {
-    timeline.fetchTimeline() // restore correct state on error
+    timeline.silentRefetch()
   }
 }
+
+function startEditLabel(event: TimelineEvent) {
+  editingLabelId.value = eventKey(event)
+}
+
+function cancelEditLabel() {
+  editingLabelId.value = null
+}
+
+function isEditingLabel(event: TimelineEvent) {
+  return editingLabelId.value === eventKey(event)
+}
+
+async function relabelEvent(event: TimelineEvent, workflowId: string) {
+  if (!event.session_id) return
+  if (event.session_id === '__optimistic__') return
+  const key = eventKey(event)
+  const currentWorkflow = workflowsStore.workflows.find(
+    (w) => w.name === event.workflow_name
+  )
+  if (currentWorkflow?.id === workflowId) {
+    editingLabelId.value = null
+    return
+  }
+  const wf = workflowsStore.workflows.find((w) => w.id === workflowId)
+  const contributes = contributesToPatternProgress(event, workflowId)
+  relabelingId.value = key
+  timeline.optimisticallyLabelEvent(event, workflowId, wf?.name ?? workflowId, wf?.color ?? null)
+  try {
+    await sessionsStore.removeEventsFromSession(event.session_id, [
+      { aw_bucket_id: event.aw_bucket_id, aw_event_id: event.aw_event_id },
+    ])
+    await api.post('/api/v1/sessions', {
+      workflow_id: workflowId,
+      date: timeline.date,
+      events: [{ aw_bucket_id: event.aw_bucket_id, aw_event_id: event.aw_event_id }],
+    })
+    if (contributes) {
+      timeline.markPatternContribution(workflowId, {
+        aw_bucket_id: event.aw_bucket_id,
+        aw_event_id: event.aw_event_id,
+      })
+    }
+    editingLabelId.value = null
+    timeline.silentRefetch()
+  } catch {
+    editingLabelId.value = null
+    timeline.silentRefetch()
+  } finally {
+    relabelingId.value = null
+  }
+}
+
+function relabelOptions(event: TimelineEvent) {
+  const currentName = event.workflow_name ?? ''
+  return workflowsStore.workflows.filter((w) => w.name !== currentName)
+}
+
+function setRowRef(el: unknown, event: TimelineEvent) {
+  const key = eventKey(event)
+  const row = el instanceof Element ? (el as HTMLTableRowElement) : null
+  if (!row) {
+    rowRefs.delete(key)
+    return
+  }
+  rowRefs.set(key, row)
+}
+
+function isInSuggestionPreview(event: TimelineEvent) {
+  if (!suggestionPreview.value) return false
+  return suggestionPreview.value.event_keys.has(eventKey(event))
+}
+
+async function removeFromPatternSuggestion(event: TimelineEvent) {
+  if (!suggestionPreview.value) return
+  const key = eventKey(event)
+  removingPatternId.value = key
+  try {
+    await api.post('/api/v1/suggestions/dismiss-event', {
+      date: timeline.date,
+      workflow_id: suggestionPreview.value.workflow_id,
+      event_ref: {
+        aw_bucket_id: event.aw_bucket_id,
+        aw_event_id: event.aw_event_id,
+      },
+    })
+    timeline.removeEventFromSuggestionPreview(event)
+    await timeline.fetchSuggestions()
+  } finally {
+    removingPatternId.value = null
+  }
+}
+
+watch(
+  () => focusEventKey.value,
+  async (key) => {
+    if (!key) return
+    await nextTick()
+    const row = rowRefs.get(key)
+    if (row) {
+      row.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }
+    timeline.consumeFocusEventKey()
+  }
+)
 </script>
 
 <template>
@@ -105,7 +283,7 @@ async function quickLabel(event: TimelineEvent, workflowId: string) {
       <table class="w-full text-sm text-left">
         <thead class="sticky top-0 bg-slate-800 text-slate-400 border-b border-slate-700">
           <tr>
-            <th class="px-2 py-2.5 w-8">
+            <th v-if="!props.patternView" class="px-2 py-2.5 w-8">
               <input
                 v-if="unlabeledEvents.length > 0"
                 type="checkbox"
@@ -130,10 +308,16 @@ async function quickLabel(event: TimelineEvent, workflowId: string) {
           <tr
             v-for="e in events"
             :key="`${e.aw_bucket_id}-${e.aw_event_id}`"
-            class="border-b border-slate-800 hover:bg-slate-800/40 transition-colors"
+            :ref="(el) => setRowRef(el, e)"
+            :class="[
+              'border-b border-slate-800 hover:bg-slate-800/40 transition-colors',
+              e.session_id && !timeline.isRecentlyPatternApplied(e) ? 'opacity-60' : '',
+              timeline.isRecentlyPatternContributionEvent(e) ? 'bg-indigo-950/30 ring-1 ring-indigo-500/40' : '',
+              timeline.isRecentlyPatternApplied(e) ? 'bg-emerald-950/25 ring-1 ring-emerald-600/35 animate-[pulse_1.2s_ease-in-out_2]' : '',
+            ]"
           >
             <!-- Select checkbox -->
-            <td class="px-2 py-2">
+            <td v-if="!props.patternView" class="px-2 py-2">
               <input
                 v-if="!e.session_id"
                 type="checkbox"
@@ -167,13 +351,20 @@ async function quickLabel(event: TimelineEvent, workflowId: string) {
 
             <!-- Workflow (confirmed label only) -->
             <td class="px-3 py-2">
-              <span
-                v-if="e.workflow_name"
-                class="inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-xs font-medium"
-                :style="e.workflow_color ? { backgroundColor: e.workflow_color + '25', color: e.workflow_color } : {}"
-              >
-                {{ e.workflow_name }}
-              </span>
+              <template v-if="e.workflow_name">
+                <span
+                  class="inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-xs font-medium"
+                  :style="e.workflow_color ? { backgroundColor: e.workflow_color + '25', color: e.workflow_color } : {}"
+                >
+                  {{ e.workflow_name }}
+                </span>
+                <span
+                  v-if="timeline.isRecentlyPatternContributionEvent(e)"
+                  class="ml-1 inline-flex items-center rounded border border-indigo-500/40 bg-indigo-500/10 px-1.5 py-0.5 text-[10px] font-medium text-indigo-300"
+                >
+                  + Pattern progress
+                </span>
+              </template>
               <span v-else class="text-slate-700">—</span>
             </td>
 
@@ -185,7 +376,7 @@ async function quickLabel(event: TimelineEvent, workflowId: string) {
                   :key="chip.id"
                   type="button"
                   :title="chip.isPrimary
-                    ? (e.suggestion_explanation ?? `Assign to ${chip.name}`)
+                    ? `Pattern confidence: ${chip.confidence} (${chip.score} indicators)`
                     : `Assign to ${chip.name}`"
                   class="inline-flex items-center gap-1 rounded px-2 py-0.5 text-xs transition-all disabled:opacity-40"
                   :class="chip.isPrimary
@@ -194,17 +385,39 @@ async function quickLabel(event: TimelineEvent, workflowId: string) {
                   :style="chip.isPrimary && chip.color
                     ? { backgroundColor: chip.color + '20', color: chip.color, outlineColor: chip.color + '60' }
                     : {}"
-                  @click="chip.isPrimary && e.suggested_workflow_id
-                    ? acceptSuggestion(e)
-                    : quickLabel(e, chip.id)"
+                  @click="quickLabel(e, chip.id)"
                 >
-                  <!-- Confidence dot for primary (auto-suggested) chip -->
+                  <!-- Confidence dot for primary (pattern-suggested) chip -->
                   <span
                     v-if="chip.isPrimary"
                     class="inline-block w-1.5 h-1.5 rounded-full shrink-0"
-                    :class="e.suggestion_confidence === 'high' ? 'bg-emerald-400' : 'bg-amber-400'"
+                    :class="chip.confidence === 'high' ? 'bg-emerald-400' : chip.confidence === 'medium' ? 'bg-amber-400' : 'bg-slate-500'"
                   />
                   {{ chip.name }}
+                </button>
+              </div>
+              <div v-else-if="isEditingLabel(e)" class="flex flex-wrap items-center gap-1">
+                <button
+                  v-for="wf in relabelOptions(e)"
+                  :key="wf.id"
+                  type="button"
+                  class="inline-flex items-center gap-1 rounded border border-slate-700 bg-slate-800/70 px-2 py-0.5 text-xs text-slate-300 hover:border-slate-500 hover:text-slate-100 transition-colors disabled:opacity-50"
+                  :disabled="relabelingId === `${e.aw_bucket_id}:${e.aw_event_id}`"
+                  @click="relabelEvent(e, wf.id)"
+                >
+                  <span
+                    class="h-1.5 w-1.5 rounded-full"
+                    :style="wf.color ? { backgroundColor: wf.color } : {}"
+                  />
+                  {{ wf.name }}
+                </button>
+                <button
+                  type="button"
+                  class="text-xs text-slate-500 hover:text-slate-300 transition-colors"
+                  :disabled="relabelingId === `${e.aw_bucket_id}:${e.aw_event_id}`"
+                  @click="cancelEditLabel()"
+                >
+                  Cancel
                 </button>
               </div>
               <span v-else class="text-slate-700">—</span>
@@ -215,21 +428,30 @@ async function quickLabel(event: TimelineEvent, workflowId: string) {
               <button
                 v-if="e.session_id"
                 type="button"
-                class="text-xs text-slate-600 hover:text-red-400 disabled:opacity-50 transition-colors"
-                :disabled="unlabelingId === `${e.aw_bucket_id}:${e.aw_event_id}`"
+                class="text-xs text-slate-500 hover:text-slate-200 disabled:opacity-50 transition-colors"
+                :disabled="e.session_id === '__optimistic__' || unlabelingId === `${e.aw_bucket_id}:${e.aw_event_id}` || relabelingId === `${e.aw_bucket_id}:${e.aw_event_id}`"
+                @click="startEditLabel(e)"
+              >
+                Edit label
+              </button>
+              <button
+                v-if="e.session_id"
+                type="button"
+                class="ml-2 text-xs text-slate-600 hover:text-red-400 disabled:opacity-50 transition-colors"
+                :disabled="e.session_id === '__optimistic__' || unlabelingId === `${e.aw_bucket_id}:${e.aw_event_id}` || relabelingId === `${e.aw_bucket_id}:${e.aw_event_id}`"
                 @click="unlabel(e)"
               >
                 Unlabel
               </button>
-              <!-- Dismiss button for auto-suggested rows -->
               <button
-                v-else-if="e.suggested_workflow_id"
+                v-else-if="isInSuggestionPreview(e)"
                 type="button"
-                class="text-xs text-slate-600 hover:text-red-400 transition-colors"
-                title="Dismiss suggestion"
-                @click="timeline.dismissAutoLabel(e)"
+                class="text-xs text-slate-600 hover:text-red-400 disabled:opacity-50 transition-colors"
+                :disabled="removingPatternId === `${e.aw_bucket_id}:${e.aw_event_id}`"
+                title="Remove this event from the current pattern suggestion"
+                @click="removeFromPatternSuggestion(e)"
               >
-                ✕
+                Remove from pattern
               </button>
               <span v-else class="inline-block w-8" />
             </td>

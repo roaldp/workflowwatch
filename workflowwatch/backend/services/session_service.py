@@ -76,12 +76,13 @@ async def create_session(body: SessionCreate, aw) -> Session:
 
     db.execute(
         """
-        INSERT INTO sessions (id, workflow_id, title, started_at, ended_at, duration, notes, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO sessions (id, workflow_id, context_workflow_id, title, started_at, ended_at, duration, notes, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             session_id,
             body.workflow_id,
+            body.context_workflow_id,
             body.title,
             started_at.isoformat(),
             ended_at.isoformat(),
@@ -127,9 +128,11 @@ async def create_session(body: SessionCreate, aw) -> Session:
 
 
 def _row_to_session(row) -> Session:
+    keys = row.keys() if hasattr(row, "keys") else []
     return Session(
         id=row["id"],
         workflow_id=row["workflow_id"],
+        context_workflow_id=row["context_workflow_id"] if "context_workflow_id" in keys else None,
         title=row["title"],
         started_at=row["started_at"],
         ended_at=row["ended_at"],
@@ -204,7 +207,7 @@ def get_session(session_id: str) -> SessionWithEvents | None:
 
 
 def update_session(session_id: str, body: SessionUpdate) -> Session | None:
-    """Update session title/notes. Return updated session or None."""
+    """Update session title/notes/context. Return updated session or None."""
     db = get_db()
     row = db.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
     if row is None:
@@ -217,6 +220,10 @@ def update_session(session_id: str, body: SessionUpdate) -> Session | None:
     if body.notes is not None:
         updates.append("notes = ?")
         params.append(body.notes)
+    if body.context_workflow_id is not None:
+        updates.append("context_workflow_id = ?")
+        # empty string means clear the context
+        params.append(None if body.context_workflow_id == "" else body.context_workflow_id)
     if not updates:
         return _row_to_session(row)
     params.append(_now_iso())

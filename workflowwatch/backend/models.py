@@ -36,16 +36,33 @@ class HealthResponse(BaseModel):
     db_path: str
 
 
+class WorkflowCompositionStepInput(BaseModel):
+    child_id: str
+    typical_pct: float | None = None  # 0.0–1.0, advisory
+    display_order: int = 0
+
+
+class WorkflowCompositionStep(BaseModel):
+    child_id: str
+    child_name: str
+    child_color: str | None
+    typical_pct: float | None
+    display_order: int
+
+
 class WorkflowCreate(BaseModel):
     name: str
     description: str | None = None
     color: str | None = None  # hex, e.g. "#3B82F6"
+    is_composite: bool = False
+    composition: list[WorkflowCompositionStepInput] = []
 
 
 class WorkflowUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     color: str | None = None
+    composition: list[WorkflowCompositionStepInput] | None = None  # None = no change, [] = clear
 
 
 class Workflow(BaseModel):
@@ -53,9 +70,28 @@ class Workflow(BaseModel):
     name: str
     description: str | None
     color: str | None
+    is_composite: bool
+    composition: list[WorkflowCompositionStep] = []  # populated for composite workflows
     created_at: str
     updated_at: str
     archived: bool
+
+
+class WorkflowBreakdownItem(BaseModel):
+    child_id: str
+    child_name: str
+    child_color: str | None
+    actual_duration: float   # seconds
+    actual_pct: float        # 0.0–1.0
+    typical_pct: float | None
+    session_count: int
+
+
+class WorkflowStats(BaseModel):
+    workflow_id: str
+    total_duration: float
+    session_count: int
+    breakdown: list[WorkflowBreakdownItem]
 
 
 class SessionEventRef(BaseModel):
@@ -69,11 +105,13 @@ class SessionCreate(BaseModel):
     title: str | None = None
     notes: str | None = None
     events: list[SessionEventRef]  # at least one
+    context_workflow_id: str | None = None  # optional composite process this session belongs to
 
 
 class Session(BaseModel):
     id: str
     workflow_id: str
+    context_workflow_id: str | None = None  # composite process, if assigned
     title: str | None
     started_at: str
     ended_at: str
@@ -86,6 +124,7 @@ class Session(BaseModel):
 class SessionUpdate(BaseModel):
     title: str | None = None
     notes: str | None = None
+    context_workflow_id: str | None = None  # pass empty string "" to clear
 
 
 class SessionEventSnapshot(BaseModel):
