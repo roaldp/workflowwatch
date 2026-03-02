@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '../api/client'
-import type { Workflow, WorkflowCreate, WorkflowUpdate } from '../types/workflow'
+import type { Workflow, WorkflowCreate, WorkflowStats, WorkflowUpdate } from '../types/workflow'
 
 export const useWorkflowsStore = defineStore('workflows', () => {
   const workflows = ref<Workflow[]>([])
@@ -43,6 +43,14 @@ export const useWorkflowsStore = defineStore('workflows', () => {
     workflows.value = workflows.value.filter((x) => x.id !== id)
   }
 
+  async function fetchWorkflowStats(id: string, start?: string, end?: string): Promise<WorkflowStats> {
+    const params = new URLSearchParams()
+    if (start) params.set('start', start)
+    if (end) params.set('end', end)
+    const qs = params.toString()
+    return api.get<WorkflowStats>(`/api/v1/workflows/${id}/stats${qs ? '?' + qs : ''}`)
+  }
+
   return {
     workflows,
     loading,
@@ -51,5 +59,6 @@ export const useWorkflowsStore = defineStore('workflows', () => {
     createWorkflow,
     updateWorkflow,
     archiveWorkflow,
+    fetchWorkflowStats,
   }
 })

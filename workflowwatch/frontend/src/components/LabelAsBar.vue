@@ -12,6 +12,21 @@ interface PendingRule {
   workflowName: string
 }
 
+interface PendingContext {
+  sessionId: string
+  leafWorkflowId: string
+  candidates: { id: string; name: string; color: string | null }[]
+}
+
+interface PendingMatches {
+  workflowId: string
+  workflowName: string
+  workflowColor: string | null
+  count: number
+  label: string  // e.g. "Arc · Gmail - Inbox" or "3 app/title combinations"
+  eventRefs: Array<{ aw_bucket_id: string; aw_event_id: number }>
+}
+
 const timeline = useTimelineStore()
 const workflowsStore = useWorkflowsStore()
 const { date, events, selectedIds, hasSelection } = storeToRefs(timeline)
@@ -23,6 +38,10 @@ const dropdownRef = ref<HTMLElement | null>(null)
 const suggestedWorkflowId = ref<string | null>(null)
 const pendingRule = ref<PendingRule | null>(null)
 const creatingRule = ref(false)
+const pendingContext = ref<PendingContext | null>(null)
+const assigningContext = ref(false)
+const pendingMatches = ref<PendingMatches | null>(null)
+const applyingMatches = ref(false)
 
 watch(open, async (isOpen) => {
   if (isOpen) {
@@ -84,7 +103,7 @@ async function labelAs(workflowId: string) {
         aw_event_id: e.aw_event_id,
       })),
     }
-    await api.post('/api/v1/sessions', body)
+    const session = await api.post<{ id: string }>('/api/v1/sessions', body)
 
     // Suggest a rule if all selected events share the same app
     const apps = new Set(eventList.map((e) => e.data?.app).filter(Boolean))
@@ -92,6 +111,54 @@ async function labelAs(workflowId: string) {
       const appName = [...apps][0] as string
       const workflowName = workflowsStore.workflows.find((w) => w.id === workflowId)?.name ?? ''
       pendingRule.value = { app: appName, workflowId, workflowName }
+    }
+
+    // Suggest assigning to a composite process that includes this workflow as a child
+    const compositeParents = workflowsStore.workflows.filter(
+      (w) => w.is_composite && w.composition.some((c) => c.child_id === workflowId)
+    )
+    if (compositeParents.length > 0 && session?.id) {
+      pendingContext.value = {
+        sessionId: session.id,
+        leafWorkflowId: workflowId,
+        candidates: compositeParents.map((w) => ({ id: w.id, name: w.name, color: w.color })),
+      }
+    }
+
+    // Find other unlabeled events with matching app+title (scan BEFORE refetch)
+    const labeledKeys = new Set(eventList.map((e) => `${e.aw_bucket_id}:${e.aw_event_id}`))
+    const labeledSigs = new Set(
+      eventList.map((e) => `${e.data?.app ?? ''}|||${e.data?.title ?? ''}`)
+    )
+    const wf = workflowsStore.workflows.find((w) => w.id === workflowId)
+    const matchingRefs: Array<{ aw_bucket_id: string; aw_event_id: number }> = []
+    const matchingSigs = new Set<string>()
+    for (const e of events.value) {
+      if (e.session_id) continue
+      if (labeledKeys.has(`${e.aw_bucket_id}:${e.aw_event_id}`)) continue
+      const sig = `${e.data?.app ?? ''}|||${e.data?.title ?? ''}`
+      if (labeledSigs.has(sig)) {
+        matchingRefs.push({ aw_bucket_id: e.aw_bucket_id, aw_event_id: e.aw_event_id })
+        matchingSigs.add(sig)
+      }
+    }
+    if (matchingRefs.length > 0) {
+      let label: string
+      if (matchingSigs.size === 1) {
+        const [app, title] = [...matchingSigs][0]!.split('|||')
+        const titleShort = (title ?? '').length > 40 ? (title ?? '').slice(0, 40) + '…' : (title ?? '')
+        label = titleShort ? `${app} · ${titleShort}` : (app ?? '')
+      } else {
+        label = `${matchingSigs.size} app/title combinations`
+      }
+      pendingMatches.value = {
+        workflowId,
+        workflowName: wf?.name ?? '',
+        workflowColor: wf?.color ?? null,
+        count: matchingRefs.length,
+        label,
+        eventRefs: matchingRefs,
+      }
     }
 
     timeline.clearSelection()
@@ -107,6 +174,38 @@ async function labelAs(workflowId: string) {
     }
   } finally {
     loading.value = false
+  }
+}
+
+async function assignContext(contextWorkflowId: string) {
+  if (!pendingContext.value) return
+  assigningContext.value = true
+  try {
+    await api.put(`/api/v1/sessions/${pendingContext.value.sessionId}`, {
+      context_workflow_id: contextWorkflowId,
+    })
+  } finally {
+    assigningContext.value = false
+    pendingContext.value = null
+  }
+}
+
+async function applyPendingMatches() {
+  if (!pendingMatches.value) return
+  applyingMatches.value = true
+  try {
+    await api.post('/api/v1/sessions', {
+      workflow_id: pendingMatches.value.workflowId,
+      date: date.value,
+      events: pendingMatches.value.eventRefs,
+    })
+    await timeline.fetchTimeline()
+  } catch {
+    // Some may already be labeled (409) — refetch to sync
+    await timeline.fetchTimeline()
+  } finally {
+    applyingMatches.value = false
+    pendingMatches.value = null
   }
 }
 
@@ -182,6 +281,71 @@ async function createRuleFromSuggestion() {
     </button>
 
     <p v-if="error" class="w-full text-sm text-red-400">{{ error }}</p>
+  </div>
+
+  <!-- Process context prompt (shown after labeling when composite workflows include this workflow) -->
+  <div
+    v-if="pendingContext"
+    class="flex flex-wrap items-center gap-3 rounded-lg border border-violet-800/40 bg-violet-950/20 px-3 py-2.5"
+  >
+    <span class="text-sm text-violet-300">
+      Part of a process?
+    </span>
+    <div class="flex flex-wrap items-center gap-2">
+      <button
+        v-for="c in pendingContext.candidates"
+        :key="c.id"
+        type="button"
+        class="flex items-center gap-1.5 rounded-md bg-violet-800/50 hover:bg-violet-700/60 px-2.5 py-1 text-xs font-medium text-violet-200 disabled:opacity-50 transition-colors"
+        :disabled="assigningContext"
+        @click="assignContext(c.id)"
+      >
+        <span
+          class="w-2 h-2 rounded-sm rotate-45 shrink-0"
+          :style="c.color ? { backgroundColor: c.color } : {}"
+        />
+        {{ c.name }}
+      </button>
+    </div>
+    <button
+      type="button"
+      class="ml-auto text-xs text-slate-500 hover:text-slate-300 transition-colors"
+      @click="pendingContext = null"
+    >
+      Not now
+    </button>
+  </div>
+
+  <!-- Pattern-match prompt: other unlabeled events with same app+title -->
+  <div
+    v-if="pendingMatches"
+    class="flex flex-wrap items-center gap-3 rounded-lg border border-sky-800/40 bg-sky-950/20 px-3 py-2.5"
+  >
+    <span class="text-sm text-sky-300">
+      <strong class="text-white">{{ pendingMatches.count }}</strong>
+      other unlabeled event{{ pendingMatches.count !== 1 ? 's' : '' }} match
+      <span class="font-medium text-slate-200">{{ pendingMatches.label }}</span>
+    </span>
+    <div class="ml-auto flex items-center gap-2">
+      <button
+        type="button"
+        class="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium disabled:opacity-50 transition-colors"
+        :style="pendingMatches.workflowColor
+          ? { backgroundColor: pendingMatches.workflowColor + '25', color: pendingMatches.workflowColor, outlineColor: pendingMatches.workflowColor + '60' }
+          : { backgroundColor: '#4f46e520', color: '#818cf8' }"
+        :disabled="applyingMatches"
+        @click="applyPendingMatches"
+      >
+        {{ applyingMatches ? 'Applying…' : `Label all as ${pendingMatches.workflowName}` }}
+      </button>
+      <button
+        type="button"
+        class="text-xs text-slate-500 hover:text-slate-300 transition-colors"
+        @click="pendingMatches = null"
+      >
+        Skip
+      </button>
+    </div>
   </div>
 
   <!-- Rule suggestion (shown after labeling, outside the selection bar) -->

@@ -9,11 +9,13 @@ export interface SessionCreate {
   title?: string | null
   notes?: string | null
   events: SessionEventRef[]
+  context_workflow_id?: string | null  // optional composite process this session belongs to
 }
 
 export interface Session {
   id: string
   workflow_id: string
+  context_workflow_id: string | null
   title: string | null
   started_at: string
   ended_at: string

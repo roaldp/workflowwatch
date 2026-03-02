@@ -65,6 +65,32 @@ CREATE TABLE IF NOT EXISTS workflow_patterns (
 CREATE INDEX IF NOT EXISTS idx_workflow_patterns_workflow
     ON workflow_patterns(workflow_id);
 
+-- WP-8: Declined pattern-based suggestions (day + workflow + block)
+CREATE TABLE IF NOT EXISTS pattern_suggestion_dismissals (
+    date           TEXT NOT NULL, -- YYYY-MM-DD
+    workflow_id    TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    block_key      TEXT NOT NULL,
+    count          INTEGER DEFAULT 1,
+    last_dismissed TEXT NOT NULL,
+    PRIMARY KEY (date, workflow_id, block_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_suggestion_dismissals_date
+    ON pattern_suggestion_dismissals(date);
+
+-- WP-8: Excluded events within a pattern suggestion (for imperfect 9/10 matches)
+CREATE TABLE IF NOT EXISTS pattern_suggestion_event_exclusions (
+    date        TEXT NOT NULL, -- YYYY-MM-DD
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    aw_bucket_id TEXT NOT NULL,
+    aw_event_id INTEGER NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (date, workflow_id, aw_bucket_id, aw_event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_suggestion_event_exclusions_date
+    ON pattern_suggestion_event_exclusions(date);
+
 -- WP-7: Tier 1 exact-match label cache
 CREATE TABLE IF NOT EXISTS label_cache (
     signature   TEXT PRIMARY KEY,
@@ -86,6 +112,18 @@ CREATE TABLE IF NOT EXISTS label_dismissals (
     PRIMARY KEY (signature, workflow_id)
 );
 
+-- Composite workflow composition (process → child workflow steps)
+CREATE TABLE IF NOT EXISTS workflow_composition (
+    parent_id       TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    child_id        TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    typical_pct     REAL,       -- 0.0–1.0, advisory only
+    display_order   INTEGER DEFAULT 0,
+    PRIMARY KEY (parent_id, child_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_composition_parent
+    ON workflow_composition(parent_id);
+
 -- User-defined label rules (Tier 0: highest priority, applied before cache/embedding)
 CREATE TABLE IF NOT EXISTS label_rules (
     id          TEXT PRIMARY KEY,
@@ -101,6 +139,21 @@ CREATE INDEX IF NOT EXISTS idx_label_rules_workflow
 """
 
 
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """Add columns that were introduced after the initial schema (safe for existing DBs)."""
+    wf_cols = {row[1] for row in conn.execute("PRAGMA table_info(workflows)")}
+    if "is_composite" not in wf_cols:
+        conn.execute("ALTER TABLE workflows ADD COLUMN is_composite INTEGER DEFAULT 0")
+        logger.info("Migration: added workflows.is_composite")
+
+    sess_cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if "context_workflow_id" not in sess_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN context_workflow_id TEXT REFERENCES workflows(id)")
+        logger.info("Migration: added sessions.context_workflow_id")
+
+    conn.commit()
+
+
 def init_db() -> None:
     """Create the data directory and initialize the database schema."""
     global _connection
@@ -113,6 +166,7 @@ def init_db() -> None:
     _connection.execute("PRAGMA journal_mode=WAL")
     _connection.execute("PRAGMA foreign_keys=ON")
     _connection.executescript(SCHEMA)
+    _apply_migrations(_connection)
     _connection.commit()
 
     logger.info("Database initialized at %s", db_path)

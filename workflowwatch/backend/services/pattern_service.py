@@ -8,6 +8,8 @@ import json
 import logging
 import re
 from collections import defaultdict
+from datetime import datetime, timezone
+from hashlib import sha1
 from urllib.parse import urlparse
 
 from ..database import get_db
@@ -20,6 +22,7 @@ MIN_BLOCK_EVENTS = 2
 MIN_BLOCK_DURATION_SECONDS = 60
 MAX_GAP_MINUTES = 15
 TITLE_KEY_MAX_LEN = 40
+MIN_APP_TITLE_PATTERN_SESSION_COUNT = 2
 
 
 def _norm(s: str | None) -> str:
@@ -49,6 +52,130 @@ def _path_prefix(url: str | None) -> str:
         return "/" + "/".join(parts) if parts else ""
     except Exception:
         return ""
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def suggestion_block_key(event_refs: list[dict]) -> str:
+    """
+    Stable key for a suggested block, derived from its event refs.
+    Sorted refs make the key order-independent.
+    """
+    pairs: list[tuple[str, int]] = []
+    for ref in event_refs:
+        if not isinstance(ref, dict):
+            continue
+        aw_bucket_id = ref.get("aw_bucket_id")
+        aw_event_id = ref.get("aw_event_id")
+        if not isinstance(aw_bucket_id, str):
+            continue
+        try:
+            event_id = int(aw_event_id)
+        except (TypeError, ValueError):
+            continue
+        pairs.append((aw_bucket_id, event_id))
+
+    if not pairs:
+        return ""
+
+    raw = "|".join(f"{bucket}:{event_id}" for bucket, event_id in sorted(pairs))
+    return sha1(raw.encode("utf-8")).hexdigest()
+
+
+def dismiss_pattern_suggestions(date: str, dismissals: list[dict]) -> int:
+    """
+    Persist dismissals for pattern suggestions.
+    Dismissals are date-scoped to avoid resurfacing the same block suggestion.
+    """
+    if not dismissals:
+        return 0
+    db = get_db()
+    now = _now_iso()
+    count = 0
+    for item in dismissals:
+        workflow_id = item.get("workflow_id")
+        event_refs = item.get("event_refs") if isinstance(item, dict) else None
+        if not isinstance(workflow_id, str) or not workflow_id:
+            continue
+        if not isinstance(event_refs, list) or not event_refs:
+            continue
+        block_key = suggestion_block_key(event_refs)
+        if not block_key:
+            continue
+        db.execute(
+            """
+            INSERT INTO pattern_suggestion_dismissals (date, workflow_id, block_key, count, last_dismissed)
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(date, workflow_id, block_key) DO UPDATE SET
+                count = count + 1,
+                last_dismissed = excluded.last_dismissed
+            """,
+            (date, workflow_id, block_key, now),
+        )
+        count += 1
+    db.commit()
+    return count
+
+
+def dismiss_pattern_suggestion_event(
+    date: str,
+    workflow_id: str,
+    event_ref: dict,
+) -> int:
+    """
+    Exclude one specific event from pattern suggestions for a workflow/date.
+    Used when a mostly-correct suggestion contains a wrong outlier.
+    """
+    aw_bucket_id = event_ref.get("aw_bucket_id") if isinstance(event_ref, dict) else None
+    aw_event_id = event_ref.get("aw_event_id") if isinstance(event_ref, dict) else None
+    if not isinstance(workflow_id, str) or not workflow_id:
+        return 0
+    if not isinstance(aw_bucket_id, str) or not aw_bucket_id:
+        return 0
+    try:
+        event_id = int(aw_event_id)
+    except (TypeError, ValueError):
+        return 0
+
+    db = get_db()
+    db.execute(
+        """
+        INSERT OR IGNORE INTO pattern_suggestion_event_exclusions
+            (date, workflow_id, aw_bucket_id, aw_event_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (date, workflow_id, aw_bucket_id, event_id, _now_iso()),
+    )
+    db.commit()
+    return 1
+
+
+def _dismissed_pattern_keys(date: str) -> set[tuple[str, str]]:
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT workflow_id, block_key
+        FROM pattern_suggestion_dismissals
+        WHERE date = ?
+        """,
+        (date,),
+    ).fetchall()
+    return {(row["workflow_id"], row["block_key"]) for row in rows}
+
+
+def _excluded_pattern_events(date: str) -> set[tuple[str, str, int]]:
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT workflow_id, aw_bucket_id, aw_event_id
+        FROM pattern_suggestion_event_exclusions
+        WHERE date = ?
+        """,
+        (date,),
+    ).fetchall()
+    return {(row["workflow_id"], row["aw_bucket_id"], int(row["aw_event_id"])) for row in rows}
 
 
 def extract_indicators(data: dict | None) -> set[tuple[str, str, str]]:
@@ -116,6 +243,8 @@ def _recompute_patterns() -> None:
         for (itype, v1, v2), cnt in counts.items():
             if not v1:
                 continue
+            if itype == "app_title" and cnt < MIN_APP_TITLE_PATTERN_SESSION_COUNT:
+                continue
             db.execute(
                 """
                 INSERT INTO workflow_patterns (workflow_id, indicator_type, value1, value2, session_count)
@@ -145,10 +274,18 @@ def get_patterns_by_workflow() -> dict[str, list[tuple[str, str, str]]]:
     ensure_patterns()
     db = get_db()
     rows = db.execute(
-        "SELECT workflow_id, indicator_type, value1, value2 FROM workflow_patterns"
+        """
+        SELECT workflow_id, indicator_type, value1, value2, session_count
+        FROM workflow_patterns
+        """
     ).fetchall()
     out: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
     for r in rows:
+        if (
+            r["indicator_type"] == "app_title"
+            and int(r["session_count"] or 0) < MIN_APP_TITLE_PATTERN_SESSION_COUNT
+        ):
+            continue
         out[r["workflow_id"]].append(
             (r["indicator_type"], r["value1"], r["value2"] or "")
         )
@@ -262,6 +399,7 @@ def _event_duration(ev) -> float:
 
 def get_suggestions_for_timeline(
     events: list,
+    date: str | None = None,
     min_matched: int = MIN_INDICATORS_MATCHED,
     min_block_events: int = MIN_BLOCK_EVENTS,
     min_block_duration: float = MIN_BLOCK_DURATION_SECONDS,
@@ -275,6 +413,9 @@ def get_suggestions_for_timeline(
     patterns = get_patterns_by_workflow()
     if not patterns:
         return []
+
+    dismissed_for_date = _dismissed_pattern_keys(date) if date else set()
+    excluded_events_for_date = _excluded_pattern_events(date) if date else set()
 
     unlabeled = [
         e for e in events
@@ -310,8 +451,44 @@ def get_suggestions_for_timeline(
         scored = score_block_against_patterns(block_indicators, patterns, min_matched)
         if not scored:
             continue
-        wf_id, score, descs = scored[0]
-        event_refs = [{"aw_bucket_id": _event_ref(e)[0], "aw_event_id": _event_ref(e)[1]} for e in block]
+        wf_id, _score, _descs = scored[0]
+        # Only include events that actually match the selected workflow pattern.
+        # This keeps preview/apply aligned with visible pattern indicators.
+        wf_pattern_set = set(patterns.get(wf_id, []))
+        matched_events = [
+            e for e in block
+            if extract_indicators(_event_data(e)) & wf_pattern_set
+        ]
+        if date:
+            matched_events = [
+                e for e in matched_events
+                if (wf_id, _event_ref(e)[0], _event_ref(e)[1]) not in excluded_events_for_date
+            ]
+        if len(matched_events) < min_block_events:
+            continue
+        matched_total_dur = sum(_event_duration(e) for e in matched_events)
+        if matched_total_dur < min_block_duration:
+            continue
+
+        # Recompute score/indicators from the remaining matched events only.
+        # This prevents removed/outlier events from still showing stale indicators.
+        matched_indicators = summarize_block([_event_data(e) for e in matched_events])
+        matched_pattern_indicators = matched_indicators & wf_pattern_set
+        score = len(matched_pattern_indicators)
+        if score < min_matched:
+            continue
+        descs = [
+            _human_readable_indicator(t, v1, v2)
+            for t, v1, v2 in sorted(matched_pattern_indicators)
+        ][:5]
+
+        event_refs = [
+            {"aw_bucket_id": _event_ref(e)[0], "aw_event_id": _event_ref(e)[1]}
+            for e in matched_events
+        ]
+        block_key = suggestion_block_key(event_refs)
+        if date and (wf_id, block_key) in dismissed_for_date:
+            continue
         suggestions.append({
             "type": "label",
             "workflow_id": wf_id,

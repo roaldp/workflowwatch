@@ -1,6 +1,8 @@
+from datetime import date
+
 from fastapi import APIRouter, HTTPException, Query
 
-from ..models import Workflow, WorkflowCreate, WorkflowUpdate
+from ..models import Workflow, WorkflowCreate, WorkflowStats, WorkflowUpdate
 from ..services import workflow_service
 
 router = APIRouter(prefix="/api/v1", tags=["workflows"])
@@ -38,3 +40,18 @@ def update_workflow(wf_id: str, body: WorkflowUpdate):
 def archive_workflow(wf_id: str):
     if not workflow_service.archive_workflow(wf_id):
         raise HTTPException(status_code=404, detail="Workflow not found")
+
+
+@router.get("/workflows/{wf_id}/stats", response_model=WorkflowStats)
+def get_workflow_stats(
+    wf_id: str,
+    start: str | None = Query(None, description="Start date YYYY-MM-DD"),
+    end: str | None = Query(None, description="End date YYYY-MM-DD"),
+):
+    """Return time breakdown for a composite workflow across its child sessions."""
+    start_date = date.fromisoformat(start) if start else None
+    end_date = date.fromisoformat(end) if end else None
+    stats = workflow_service.get_workflow_stats(wf_id, start_date, end_date)
+    if stats is None:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return stats

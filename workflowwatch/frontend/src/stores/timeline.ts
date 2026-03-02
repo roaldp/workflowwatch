@@ -6,6 +6,28 @@ import { todayISO, addDays } from '../types/timeline'
 import { eventKey } from '../types/session'
 import type { Suggestion } from '../types/session'
 
+interface SuggestionPreview {
+  workflow_id: string
+  workflow_name: string
+  score: number
+  matched_indicators: string[]
+  event_keys: Set<string>
+}
+
+function suggestionEventKeySet(suggestion: Suggestion): Set<string> {
+  return new Set(
+    suggestion.event_refs.map((r) => eventKey(r.aw_bucket_id, r.aw_event_id))
+  )
+}
+
+function overlapSize(a: Set<string>, b: Set<string>): number {
+  let count = 0
+  for (const key of a) {
+    if (b.has(key)) count += 1
+  }
+  return count
+}
+
 export const useTimelineStore = defineStore('timeline', () => {
   const date = ref(todayISO())
   const events = ref<TimelineEvent[]>([])
@@ -14,50 +36,16 @@ export const useTimelineStore = defineStore('timeline', () => {
   const selectedIds = ref<Set<string>>(new Set())
   const suggestions = ref<Suggestion[]>([])
   const suggestionsLoading = ref(false)
-
-  // WP-7: track ongoing accept/dismiss operations
-  const acceptingAutoLabels = ref(false)
+  const suggestionPreview = ref<SuggestionPreview | null>(null)
+  const recentlyAppliedPatternKeys = ref<Set<string>>(new Set())
+  const focusEventKey = ref<string | null>(null)
+  const recentPatternContributionEventCounts = ref<Map<string, number>>(new Map())
+  const recentPatternContributionWorkflowCounts = ref<Map<string, number>>(new Map())
 
   const sortedEvents = computed(() => {
     return [...events.value].sort(
       (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
     )
-  })
-
-  // WP-7: events that have auto-label suggestions
-  const autoLabeledEvents = computed(() =>
-    sortedEvents.value.filter((e) => !e.session_id && e.suggested_workflow_id)
-  )
-
-  const highConfidenceAutoLabels = computed(() =>
-    autoLabeledEvents.value.filter((e) => e.suggestion_confidence === 'high')
-  )
-
-  const autoLabelCount = computed(() => autoLabeledEvents.value.length)
-  const highConfidenceCount = computed(() => highConfidenceAutoLabels.value.length)
-
-  // Group auto-labeled events by suggested workflow for the banner
-  const autoLabelsByWorkflow = computed(() => {
-    const groups = new Map<string, {
-      id: string; name: string; color: string | null
-      events: TimelineEvent[]; highCount: number
-    }>()
-    for (const e of autoLabeledEvents.value) {
-      const id = e.suggested_workflow_id!
-      if (!groups.has(id)) {
-        groups.set(id, {
-          id,
-          name: e.suggested_workflow_name ?? id,
-          color: e.suggested_workflow_color ?? null,
-          events: [],
-          highCount: 0,
-        })
-      }
-      const g = groups.get(id)!
-      g.events.push(e)
-      if (e.suggestion_confidence === 'high') g.highCount++
-    }
-    return [...groups.values()]
   })
 
   function eventKeyFor(e: TimelineEvent) {
@@ -93,13 +81,27 @@ export const useTimelineStore = defineStore('timeline', () => {
     loading.value = true
     error.value = null
     try {
-      // WP-7: always fetch with auto_label=true to get suggestions inline
       events.value = await api.get<TimelineEvent[]>(
-        `/api/v1/timeline?date=${date.value}&auto_label=true`
+        `/api/v1/timeline?date=${date.value}`
       )
+      if (suggestionPreview.value) {
+        const eventKeys = new Set(events.value.map((e) => eventKeyFor(e)))
+        const validPreviewKeys = new Set(
+          [...suggestionPreview.value.event_keys].filter((k) => eventKeys.has(k))
+        )
+        if (validPreviewKeys.size === 0) {
+          suggestionPreview.value = null
+        } else {
+          suggestionPreview.value = {
+            ...suggestionPreview.value,
+            event_keys: validPreviewKeys,
+          }
+        }
+      }
     } catch (e) {
       error.value = e instanceof Error ? e.message : 'Failed to load timeline'
       events.value = []
+      suggestionPreview.value = null
     } finally {
       loading.value = false
       if (!error.value) fetchSuggestions()
@@ -110,7 +112,7 @@ export const useTimelineStore = defineStore('timeline', () => {
   async function silentRefetch() {
     try {
       events.value = await api.get<TimelineEvent[]>(
-        `/api/v1/timeline?date=${date.value}&auto_label=true`
+        `/api/v1/timeline?date=${date.value}`
       )
       fetchSuggestions()
     } catch {
@@ -150,6 +152,19 @@ export const useTimelineStore = defineStore('timeline', () => {
     }
   }
 
+  function optimisticallyUnlabelEvent(event: TimelineEvent) {
+    events.value = events.value.map((e) =>
+      e.aw_bucket_id === event.aw_bucket_id && e.aw_event_id === event.aw_event_id
+        ? {
+            ...e,
+            session_id: null,
+            workflow_name: null,
+            workflow_color: null,
+          }
+        : e
+    )
+  }
+
   async function fetchSuggestions() {
     suggestionsLoading.value = true
     try {
@@ -157,6 +172,28 @@ export const useTimelineStore = defineStore('timeline', () => {
         `/api/v1/suggestions?date=${date.value}`
       )
       suggestions.value = res.suggestions ?? []
+      if (suggestionPreview.value) {
+        const current = suggestionPreview.value
+        let bestMatch: Suggestion | null = null
+        let bestOverlap = 0
+        for (const s of suggestions.value) {
+          if (s.workflow_id !== current.workflow_id) continue
+          const keys = suggestionEventKeySet(s)
+          const overlap = overlapSize(current.event_keys, keys)
+          if (overlap > bestOverlap) {
+            bestMatch = s
+            bestOverlap = overlap
+          }
+        }
+        if (bestMatch && bestOverlap > 0) {
+          suggestionPreview.value = {
+            ...current,
+            score: bestMatch.score,
+            matched_indicators: bestMatch.matched_indicators ?? [],
+            event_keys: suggestionEventKeySet(bestMatch),
+          }
+        }
+      }
     } catch {
       suggestions.value = []
     } finally {
@@ -164,152 +201,91 @@ export const useTimelineStore = defineStore('timeline', () => {
     }
   }
 
-  // WP-7: Accept a single auto-label suggestion (optimistic — instant UI update)
-  async function acceptAutoLabel(event: TimelineEvent) {
-    if (!event.suggested_workflow_id) return
-    // Instant local update
-    optimisticallyLabelEvent(
-      event,
-      event.suggested_workflow_id,
-      event.suggested_workflow_name ?? '',
-      event.suggested_workflow_color ?? null,
-    )
-    try {
-      await api.post('/api/v1/auto-label/accept', {
-        date: date.value,
-        accepts: [
-          {
-            aw_bucket_id: event.aw_bucket_id,
-            aw_event_id: event.aw_event_id,
-            workflow_id: event.suggested_workflow_id,
-          },
-        ],
-      })
-      silentRefetch() // background sync, no loading flash
-    } catch {
-      fetchTimeline() // restore on error
+  function previewSuggestion(suggestion: Suggestion, workflowName: string) {
+    suggestionPreview.value = {
+      workflow_id: suggestion.workflow_id,
+      workflow_name: workflowName,
+      score: suggestion.score,
+      matched_indicators: suggestion.matched_indicators ?? [],
+      event_keys: new Set(
+        suggestion.event_refs.map((r) => eventKey(r.aw_bucket_id, r.aw_event_id))
+      ),
     }
   }
 
-  // WP-7: Accept all suggestions for a specific workflow (optimistic)
-  async function acceptAllForWorkflow(workflowId: string) {
-    const toAccept = autoLabeledEvents.value.filter(
-      (e) => e.suggested_workflow_id === workflowId
-    )
-    if (!toAccept.length) return
-    // Snapshot workflow info before optimistic updates clear the suggestions
-    const wfName = toAccept[0]?.suggested_workflow_name ?? ''
-    const wfColor = toAccept[0]?.suggested_workflow_color ?? null
-    for (const event of toAccept) {
-      optimisticallyLabelEvent(event, workflowId, wfName, wfColor)
+  function clearSuggestionPreview() {
+    suggestionPreview.value = null
+  }
+
+  function removeEventFromSuggestionPreview(event: TimelineEvent) {
+    if (!suggestionPreview.value) return
+    const key = eventKeyFor(event)
+    if (!suggestionPreview.value.event_keys.has(key)) return
+    const next = new Set(suggestionPreview.value.event_keys)
+    next.delete(key)
+    if (next.size === 0) {
+      suggestionPreview.value = null
+      return
     }
-    try {
-      await api.post('/api/v1/auto-label/accept', {
-        date: date.value,
-        accepts: toAccept.map((e) => ({
-          aw_bucket_id: e.aw_bucket_id,
-          aw_event_id: e.aw_event_id,
-          workflow_id: workflowId,
-        })),
-      })
-      silentRefetch()
-    } catch {
-      fetchTimeline()
+    suggestionPreview.value = {
+      ...suggestionPreview.value,
+      event_keys: next,
     }
   }
 
-  // WP-7: Dismiss all suggestions for a specific workflow
-  async function dismissAllForWorkflow(workflowId: string) {
-    const toDismiss = autoLabeledEvents.value.filter(
-      (e) => e.suggested_workflow_id === workflowId
-    )
-    if (!toDismiss.length) return
-    try {
-      await api.post('/api/v1/auto-label/dismiss', {
-        date: date.value,
-        dismissals: toDismiss.map((e) => ({
-          aw_bucket_id: e.aw_bucket_id,
-          aw_event_id: e.aw_event_id,
-          workflow_id: workflowId,
-        })),
-      })
-      // Optimistically clear from local state
-      events.value = events.value.map((e) =>
-        e.suggested_workflow_id === workflowId
-          ? {
-              ...e,
-              suggested_workflow_id: null,
-              suggested_workflow_name: null,
-              suggested_workflow_color: null,
-              suggestion_confidence: null,
-              suggestion_source: null,
-              suggestion_explanation: null,
-            }
-          : e
-      )
-    } catch {
-      // Non-critical
-    }
+  function markPatternApplied(eventRefs: Array<{ aw_bucket_id: string; aw_event_id: number }>) {
+    const keys = new Set(eventRefs.map((r) => eventKey(r.aw_bucket_id, r.aw_event_id)))
+    recentlyAppliedPatternKeys.value = keys
+    focusEventKey.value = eventRefs.length > 0
+      ? eventKey(eventRefs[0]!.aw_bucket_id, eventRefs[0]!.aw_event_id)
+      : null
+    window.setTimeout(() => {
+      recentlyAppliedPatternKeys.value = new Set()
+    }, 2400)
   }
 
-  // WP-7: Accept all high-confidence auto-labels in bulk (optimistic)
-  async function acceptAllHighConfidence() {
-    const toAccept = highConfidenceAutoLabels.value
-    if (!toAccept.length) return
-    for (const event of toAccept) {
-      optimisticallyLabelEvent(
-        event,
-        event.suggested_workflow_id!,
-        event.suggested_workflow_name ?? '',
-        event.suggested_workflow_color ?? null,
-      )
-    }
-    try {
-      await api.post('/api/v1/auto-label/accept', {
-        date: date.value,
-        accepts: toAccept.map((e) => ({
-          aw_bucket_id: e.aw_bucket_id,
-          aw_event_id: e.aw_event_id,
-          workflow_id: e.suggested_workflow_id!,
-        })),
-      })
-      silentRefetch()
-    } catch {
-      fetchTimeline()
-    }
+  function markPatternContribution(
+    workflowId: string,
+    eventRef: { aw_bucket_id: string; aw_event_id: number },
+  ) {
+    const key = eventKey(eventRef.aw_bucket_id, eventRef.aw_event_id)
+    const eventCounts = new Map(recentPatternContributionEventCounts.value)
+    eventCounts.set(key, (eventCounts.get(key) ?? 0) + 1)
+    recentPatternContributionEventCounts.value = eventCounts
+
+    const workflowCounts = new Map(recentPatternContributionWorkflowCounts.value)
+    workflowCounts.set(workflowId, (workflowCounts.get(workflowId) ?? 0) + 1)
+    recentPatternContributionWorkflowCounts.value = workflowCounts
+
+    window.setTimeout(() => {
+      const nextEventCounts = new Map(recentPatternContributionEventCounts.value)
+      const eventCount = nextEventCounts.get(key) ?? 0
+      if (eventCount <= 1) nextEventCounts.delete(key)
+      else nextEventCounts.set(key, eventCount - 1)
+      recentPatternContributionEventCounts.value = nextEventCounts
+
+      const nextWorkflowCounts = new Map(recentPatternContributionWorkflowCounts.value)
+      const workflowCount = nextWorkflowCounts.get(workflowId) ?? 0
+      if (workflowCount <= 1) nextWorkflowCounts.delete(workflowId)
+      else nextWorkflowCounts.set(workflowId, workflowCount - 1)
+      recentPatternContributionWorkflowCounts.value = nextWorkflowCounts
+    }, 2400)
   }
 
-  // WP-7: Dismiss an auto-label suggestion (negative signal)
-  async function dismissAutoLabel(event: TimelineEvent) {
-    if (!event.suggested_workflow_id) return
-    try {
-      await api.post('/api/v1/auto-label/dismiss', {
-        date: date.value,
-        dismissals: [
-          {
-            aw_bucket_id: event.aw_bucket_id,
-            aw_event_id: event.aw_event_id,
-            workflow_id: event.suggested_workflow_id,
-          },
-        ],
-      })
-      // Optimistically clear the suggestion from local state
-      events.value = events.value.map((e) =>
-        e.aw_bucket_id === event.aw_bucket_id && e.aw_event_id === event.aw_event_id
-          ? {
-              ...e,
-              suggested_workflow_id: null,
-              suggested_workflow_name: null,
-              suggested_workflow_color: null,
-              suggestion_confidence: null,
-              suggestion_source: null,
-              suggestion_explanation: null,
-            }
-          : e
-      )
-    } catch {
-      // Ignore dismiss errors — non-critical
-    }
+  function isRecentlyPatternApplied(event: TimelineEvent) {
+    return recentlyAppliedPatternKeys.value.has(eventKeyFor(event))
+  }
+
+  function isRecentlyPatternContributionEvent(event: TimelineEvent) {
+    return recentPatternContributionEventCounts.value.has(eventKeyFor(event))
+  }
+
+  function hasRecentPatternContribution(workflowId: string) {
+    return recentPatternContributionWorkflowCounts.value.has(workflowId)
+  }
+
+  function consumeFocusEventKey() {
+    focusEventKey.value = null
   }
 
   function setDate(iso: string) {
@@ -339,12 +315,8 @@ export const useTimelineStore = defineStore('timeline', () => {
     selectedCount,
     suggestions,
     suggestionsLoading,
-    autoLabeledEvents,
-    highConfidenceAutoLabels,
-    autoLabelsByWorkflow,
-    autoLabelCount,
-    highConfidenceCount,
-    acceptingAutoLabels,
+    suggestionPreview,
+    focusEventKey,
     isSelected,
     toggleEvent,
     clearSelection,
@@ -352,12 +324,17 @@ export const useTimelineStore = defineStore('timeline', () => {
     fetchTimeline,
     silentRefetch,
     optimisticallyLabelEvent,
+    optimisticallyUnlabelEvent,
     fetchSuggestions,
-    acceptAutoLabel,
-    acceptAllForWorkflow,
-    dismissAllForWorkflow,
-    acceptAllHighConfidence,
-    dismissAutoLabel,
+    previewSuggestion,
+    clearSuggestionPreview,
+    removeEventFromSuggestionPreview,
+    markPatternApplied,
+    markPatternContribution,
+    isRecentlyPatternApplied,
+    isRecentlyPatternContributionEvent,
+    hasRecentPatternContribution,
+    consumeFocusEventKey,
     setDate,
     goToday,
     goPrev,
