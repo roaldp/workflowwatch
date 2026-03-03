@@ -10,6 +10,7 @@ from .database import close_db, init_db
 from .routers.auto_label import router as auto_label_router
 from .routers.label_rules import router as label_rules_router
 from .routers.sessions import router as sessions_router
+from .routers.streak import router as streak_router
 from .routers.suggestions import router as suggestions_router
 from .routers.timeline import router as timeline_router
 from .routers.workflows import router as workflows_router
@@ -82,6 +83,7 @@ app.include_router(sessions_router)
 app.include_router(suggestions_router)
 app.include_router(auto_label_router)
 app.include_router(label_rules_router)
+app.include_router(streak_router)
 
 
 @app.get("/")

@@ -14,6 +14,7 @@ from ..models import (
     TimelineEvent,
 )
 from . import cache_service
+from . import streak_service
 from .pattern_service import recompute_patterns
 from .timeline_service import get_timeline
 from .workflow_service import get_workflow
@@ -113,6 +114,9 @@ async def create_session(body: SessionCreate, aw) -> Session:
         )
 
     db.commit()
+
+    # Track XP: increment daily progress for the target date
+    streak_service.increment_daily_progress(target_date, len(matched))
 
     recompute_patterns()
     # WP-7: update label cache with the newly created session's events
@@ -240,8 +244,22 @@ def update_session(session_id: str, body: SessionUpdate) -> Session | None:
 def delete_session(session_id: str) -> bool:
     """Hard delete session and its session_events. Return True if deleted."""
     db = get_db()
+    # Count events and resolve date for XP decrement before deleting
+    event_rows = db.execute(
+        "SELECT event_timestamp FROM session_events WHERE session_id = ?",
+        (session_id,),
+    ).fetchall()
+    event_count = len(event_rows)
+    event_date = None
+    if event_rows:
+        event_date = date.fromisoformat(event_rows[0]["event_timestamp"][:10])
+
     cur = db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
     db.commit()
+
+    if cur.rowcount > 0 and event_date and event_count > 0:
+        streak_service.decrement_daily_progress(event_date, event_count)
+
     return cur.rowcount > 0
 
 
@@ -321,12 +339,21 @@ def remove_events_from_session(
     row = db.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
     if row is None:
         return None
+
+    # Resolve date for XP decrement from session started_at
+    event_date = date.fromisoformat(row["started_at"][:10])
+
+    removed_count = 0
     for ref in event_refs:
-        db.execute(
+        cur = db.execute(
             "DELETE FROM session_events WHERE session_id = ? AND aw_bucket_id = ? AND aw_event_id = ?",
             (session_id, ref.aw_bucket_id, ref.aw_event_id),
         )
+        removed_count += cur.rowcount
     db.commit()
+
+    if removed_count > 0:
+        streak_service.decrement_daily_progress(event_date, removed_count)
     _recompute_session_times(db, session_id)
     row = db.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
     return _row_to_session(row) if row else None

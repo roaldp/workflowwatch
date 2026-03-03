@@ -191,3 +191,39 @@ class LabelRule(BaseModel):
     created_at: str
     workflow_name: str
     workflow_color: str | None
+
+
+# Daily Streak & Swipe Card models
+
+class StreakData(BaseModel):
+    date: str
+    total_xp: int
+    today_xp: int
+    current_streak: int
+
+
+class SwipeCardItem(BaseModel):
+    aw_bucket_id: str
+    aw_event_id: int
+    timestamp: datetime
+    duration: float
+    data: dict[str, Any]
+    suggested_workflow_id: str
+    suggested_workflow_name: str | None = None
+    suggested_workflow_color: str | None = None
+    suggestion_confidence: str  # "high" | "medium"
+    suggestion_source: str      # "cache" | "embedding" | "rule"
+
+
+class SwipeCardQueue(BaseModel):
+    date: str
+    cards: list[SwipeCardItem]
+    total_unlabeled: int
+    total_with_suggestions: int
+
+
+class SwipeActionBody(BaseModel):
+    date: str
+    aw_bucket_id: str
+    aw_event_id: int
+    workflow_id: str
