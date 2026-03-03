@@ -136,6 +136,13 @@ CREATE TABLE IF NOT EXISTS label_rules (
 
 CREATE INDEX IF NOT EXISTS idx_label_rules_workflow
     ON label_rules(workflow_id);
+
+-- Daily streak progress tracking
+CREATE TABLE IF NOT EXISTS daily_progress (
+    date            TEXT PRIMARY KEY,
+    events_labeled  INTEGER DEFAULT 0,
+    updated_at      TEXT NOT NULL
+);
 """
 
 
@@ -150,6 +157,21 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     if "context_workflow_id" not in sess_cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN context_workflow_id TEXT REFERENCES workflows(id)")
         logger.info("Migration: added sessions.context_workflow_id")
+
+    # Backfill daily_progress from existing session_events
+    existing_progress = conn.execute("SELECT COUNT(*) FROM daily_progress").fetchone()[0]
+    if existing_progress == 0:
+        conn.execute("""
+            INSERT OR IGNORE INTO daily_progress (date, events_labeled, updated_at)
+            SELECT DATE(event_timestamp) AS date,
+                   COUNT(*) AS events_labeled,
+                   MAX(event_timestamp) AS updated_at
+            FROM session_events
+            GROUP BY DATE(event_timestamp)
+        """)
+        backfilled = conn.execute("SELECT COUNT(*) FROM daily_progress").fetchone()[0]
+        if backfilled > 0:
+            logger.info("Migration: backfilled daily_progress with %d days", backfilled)
 
     conn.commit()
 

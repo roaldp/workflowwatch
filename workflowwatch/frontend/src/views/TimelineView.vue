@@ -6,6 +6,7 @@ import TimelineBar from '../components/TimelineBar.vue'
 import EventList from '../components/EventList.vue'
 import LabelAsBar from '../components/LabelAsBar.vue'
 import SuggestionsPanel from '../components/SuggestionsPanel.vue'
+import DailyStreakPanel from '../components/DailyStreakPanel.vue'
 
 const store = useTimelineStore()
 const { date, events, loading, error, suggestionPreview } = storeToRefs(store)
@@ -83,6 +84,7 @@ function clearEventFilters() {
         <h2 class="text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">Timeline</h2>
         <TimelineBar :events="events" :date="date" />
       </section>
+      <DailyStreakPanel />
       <SuggestionsPanel />
       <LabelAsBar />
       <section>
