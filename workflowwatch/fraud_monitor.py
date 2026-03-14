@@ -287,7 +287,8 @@ def main() -> None:
         logger.info("Shutting down...")
         running = False
     signal.signal(signal.SIGINT, _stop)
-    signal.signal(signal.SIGTERM, _stop)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _stop)
 
     while running:
         try:
